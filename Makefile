@@ -15,10 +15,6 @@ clean: app-clean module-clean
 check: app-check module-check
 endif
 
-
-
-# Thrift Application
-
 CXX = g++
 
 CLEANFILES =
@@ -58,13 +54,13 @@ LDLIBS += $(shell pkg-config --libs thrift)
 # boost flags
 ifeq ($(OS),Darwin)
 BOOST_DIR = $(shell brew --prefix)/Cellar/boost/1.76.0
+else
+BOOST_DIR = /usr
+endif
 CPPFLAGS += -I$(BOOST_DIR)/include
 LDLIBS += -L$(BOOST_DIR)/lib
-else
-CPPFLAGS += $(shell pkg-config --cflags boost)
-LDFLAGS += $(shell pkg-config --libs boost)
-endif
 
+# Thrift Application
 CLEANFILES += edu-client-pci edu-client-socket edu-server
 app: edu-client-pci edu-client-socket edu-server
 
@@ -78,8 +74,13 @@ $(GENSRC): edu.thrift.stamp
 %.o: %.cpp $(HDR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
+ifeq ($(OS),Linux)
 edu-client-pci: edu-client.cpp $(OBJ)
-	$(CXX) $(CPPFLAGS) -DUSE_FD_TRANSPORT=1 $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CXX) $(CPPFLAGS) -DUSE_FD_TRANSPORT=1 $(CXXFLAGS) $(LDFLAGS) -static -o $@ $^ $(LDLIBS)
+else
+edu-client-pci: edu-client-pci.static
+	cp $< $@
+endif
 
 edu-client-socket: edu-client.cpp $(OBJ)
 	$(CXX) $(CPPFLAGS) -DUSE_FD_TRANSPORT=0 $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -90,32 +91,51 @@ edu-server: edu-server.cpp $(OBJ)
 app-clean:
 	rm -Rf $(GENDIR) $(CLEANFILES) *.o || true
 
-# Linux kernel OOT module
-obj-m += pci-edu.o
-module:
-	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
-
-module-clean:
-	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean || true
-
 app-check: edu-client-socket edu-server
 	./edu-server& \
 	SERVER_PID=$$!; \
 	sleep 1; \
 	./edu-client-socket; \
 	SUCCESS=$$?; \
-	kill -TERM $$SERVER_PID && \
+	kill -TERM $$SERVER_PID  >/dev/null 2>&1; \
 	wait $$SERVER_PID >/dev/null 2>&1; \
 	exit $$SUCCESS
 
-# TODO: module-check
-module-check:
+# Linux kernel OOT module
+ifeq ($(OS),Linux)
+obj-m += pci-edu.o
+module:
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
+
+module-clean:
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean || true
+else
+module:
 	true
 
-# qemu-system-x86_64 \
-#   -machine q35,accel=kvm \
-#   -cpu host \
-#   -dev edu,dma_mask=0xffffffffffffffff \
-#   -smp 8 -m 16G \
-#   -hda qemu.img \
-#   $CDROM
+module-clean:
+	true
+endif
+
+QEMU_OPTS = \
+	-machine q35 \
+	-device edu \
+	-netdev user,id=eth0,hostfwd=tcp::2222-:22 \
+	-device e1000,netdev=eth0 \
+	-kernel bzImage
+
+module-check: bzImage pci-edu.ko edu-client-pci edu-server
+	./edu-server& \
+	SERVER_PID=$$!; \
+	sleep 1; \
+	qemu-system-x86_64 $(QEMU_OPTS) & \
+	QEMU_PID=$$!; \
+	sleep 1; \
+	scp -oStrictHostKeyChecking=no -P 2222 pci-edu.ko edu-client-pci root@localhost:/root; \
+	ssh -oStrictHostKeyChecking=no -p 2222 root@localhost '/sbin/insmod pci-edu.ko && ./edu-client-pci'; \
+	SUCCESS=$$?; \
+	kill -TERM $$SERVER_PID >/dev/null 2>&1; \
+	wait $$SERVER_PID >/dev/null 2>&1; \
+	kill -TERM $$QEMU_PID >/dev/null 2>&1; \
+	wait $$QEMU_PID >/dev/null 2>&1; \
+	exit $$SUCCESS
