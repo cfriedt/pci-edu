@@ -11,6 +11,7 @@
 #include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
 
 #include "pci-edu.h"
 
