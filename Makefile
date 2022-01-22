@@ -112,3 +112,10 @@ app-check: edu-client-socket edu-server
 module-check:
 	true
 
+# qemu-system-x86_64 \
+#   -machine q35,accel=kvm \
+#   -cpu host \
+#   -dev edu,dma_mask=0xffffffffffffffff \
+#   -smp 8 -m 16G \
+#   -hda qemu.img \
+#   $CDROM
