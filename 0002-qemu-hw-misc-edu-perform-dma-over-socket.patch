@@ -1,0 +1,109 @@
+From 37dd08bbc63e4655b7dba469d1c1f611cb647b77 Mon Sep 17 00:00:00 2001
+From: Christopher Friedt <chrisfriedt@gmail.com>
+Date: Thu, 20 Jan 2022 09:14:30 -0500
+Subject: [PATCH] hw: misc: edu: perform dma over socket
+
+Perform a socket write after writing to DMA memory.
+Perform a socket read before reading from DMA memory.
+
+Signed-off-by: Christopher Friedt <chrisfriedt@gmail.com>
+---
+ hw/misc/edu.c | 57 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+diff --git a/hw/misc/edu.c b/hw/misc/edu.c
+index 73e97a54e7..6cc14c89c2 100644
+--- a/hw/misc/edu.c
++++ b/hw/misc/edu.c
+@@ -75,6 +75,8 @@ struct EduState {
+     QEMUTimer dma_timer;
+     char dma_buf[DMA_SIZE];
+     uint64_t dma_mask;
++
++    int remote_fd;
+ };
+ 
+ static bool edu_msi_enabled(EduState *edu)
+@@ -131,6 +133,33 @@ static dma_addr_t edu_clamp_addr(const EduState *edu, dma_addr_t addr)
+     return res;
+ }
+ 
++static void fd_dma_read(EduState *edu, dma_addr_t addr, void *buf, dma_addr_t len)
++{
++    ssize_t rv;
++
++    rv = read(edu->remote_fd, buf, len);
++    if (rv == -1) {
++        perror("read");
++        return;
++    }
++
++    edu->dma.cnt = rv;
++}
++
++static void fd_dma_write(EduState *edu, dma_addr_t addr, const void *buf, dma_addr_t len)
++{
++    ssize_t rv;
++    size_t w = 0;
++
++    for (size_t n = len; n; w += rv, n -= rv, buf = (uint8_t *)buf + rv) {
++        rv = write(edu->remote_fd, buf, n);
++        if (rv == -1) {
++            perror("write");
++            return;
++        }
++    }
++}
++
+ static void edu_dma_timer(void *opaque)
+ {
+     EduState *edu = opaque;
+@@ -146,10 +175,14 @@ static void edu_dma_timer(void *opaque)
+         dst -= DMA_START;
+         pci_dma_read(&edu->pdev, edu_clamp_addr(edu, edu->dma.src),
+                 edu->dma_buf + dst, edu->dma.cnt);
++        fd_dma_write(edu, dst + DMA_START,
++                edu->dma_buf + dst, edu->dma.cnt);
+     } else {
+         uint64_t src = edu->dma.src;
+         edu_check_range(src, edu->dma.cnt, DMA_START, DMA_SIZE);
+         src -= DMA_START;
++        fd_dma_read(edu, edu_clamp_addr(edu, edu->dma.dst),
++                edu->dma_buf + src, edu->dma.cnt);
+         pci_dma_write(&edu->pdev, edu_clamp_addr(edu, edu->dma.dst),
+                 edu->dma_buf + src, edu->dma.cnt);
+     }
+@@ -376,6 +409,30 @@ static void pci_edu_realize(PCIDevice *pdev, Error **errp)
+     memory_region_init_io(&edu->mmio, OBJECT(edu), &edu_mmio_ops, edu,
+                     "edu-mmio", 1 * MiB);
+     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &edu->mmio);
++
++    edu->remote_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (edu->remote_fd == -1) {
++        perror("socket");
++        return;
++    }
++
++    // TODO: get these parameters via command line
++    const char *remote_addr = "127.0.0.1";
++    const int16_t remote_port = 4242;
++
++    struct sockaddr_in sai = {0};
++    sai.sin_family = AF_INET;
++    inet_pton(AF_INET, remote_addr, &sai.sin_addr.s_addr);
++    sai.sin_port = htons(remote_port);
++
++    if (connect(edu->remote_fd, &sai, sizeof(sai)) == -1) {
++        perror("connect");
++        close(edu->remote_fd);
++        edu->remote_fd = -1;
++        return;
++    }
++
++    printf("connected to %s:%d\n", remote_addr, remote_port);
+ }
+ 
+ static void pci_edu_uninit(PCIDevice *pdev)
+-- 
+2.30.1 (Apple Git-130)
+
