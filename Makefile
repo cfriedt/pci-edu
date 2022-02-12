@@ -5,15 +5,9 @@
 
 OS = $(shell uname -s)
 
-ifeq ($(OS),Darwin)
-all: app
-clean: app-clean
-check: app-check
-else
 all: app module
 clean: app-clean module-clean
 check: app-check module-check
-endif
 
 CXX = g++
 
