@@ -125,8 +125,8 @@ module-check: bzImage pci-edu.ko edu-client-pci edu-server
 	qemu-system-x86_64 $(QEMU_OPTS) & \
 	QEMU_PID=$$!; \
 	sleep 1; \
-	scp -oStrictHostKeyChecking=no -P 2222 pci-edu.ko edu-client-pci root@localhost:/root; \
-	ssh -oStrictHostKeyChecking=no -p 2222 root@localhost '/sbin/insmod pci-edu.ko && ./edu-client-pci'; \
+	scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=QUIET -P 2222 pci-edu.ko edu-client-pci root@localhost:/root; \
+	ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=QUIET -p 2222 root@localhost '/sbin/insmod pci-edu.ko && ./edu-client-pci'; \
 	SUCCESS=$$?; \
 	kill -TERM $$SERVER_PID >/dev/null 2>&1; \
 	wait $$SERVER_PID >/dev/null 2>&1; \
