@@ -1,6 +1,8 @@
 // Copyright (c) 2022 Friedt Professional Engineering Services, Inc
 // SPDX-License-Identifier: MIT
 
+#include <fcntl.h>
+
 #include <thrift/TToString.h>
 #include <thrift/concurrency/ThreadFactory.h>
 #include <thrift/concurrency/ThreadManager.h>
@@ -15,6 +17,8 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+
+#include "thrift/transport/TFDServer.h"
 
 #include "Edu.h"
 
@@ -50,8 +54,21 @@ int main(void) {
   std::shared_ptr<EduHandler> handler(new EduHandler());
   std::shared_ptr<TProcessor> processor(new EduProcessor(handler));
 
+#if USE_FD_TRANSPORT
+  int fd = open("/dev/pci_edu0", O_RDWR);
+  if (fd == -1)
+  {
+    perror("open");
+    return EXIT_FAILURE;
+  }
+  std::shared_ptr<TServerTransport> strans(
+      new TFDServer(fd));
+#else
+  std::shared_ptr<TServerTransport> strans(new TServerSocket(4242));
+#endif
+
   TSimpleServer server(processor,
-                       std::make_shared<TServerSocket>(4242), // port
+                       strans,
                        std::make_shared<TBufferedTransportFactory>(),
                        std::make_shared<TBinaryProtocolFactory>());
 

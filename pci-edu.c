@@ -23,7 +23,7 @@ MODULE_AUTHOR("Christopher Friedt <chrisfriedt@gmail.com>");
 MODULE_DESCRIPTION("Driver for Jiri Slaby's Educational Qemu PCI device");
 // See https://gitlab.com/qemu-project/qemu/-/blob/master/docs/specs/edu.txt
 //     https://gitlab.com/qemu-project/qemu/-/blob/master/hw/misc/edu.c
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("Dual MIT/GPL");
 
 static unsigned long dma_mask = PCI_EDU_DMA_MASK_DEFAULT;
 module_param(dma_mask, ulong, 0);
@@ -34,6 +34,8 @@ struct pci_edu_data {
   struct pci_dev *pdev;
   struct miscdevice misc;
   char nodename[64];
+  struct file *owner;
+  wait_queue_head_t wq;
 };
 
 struct __attribute__((aligned(BITS_PER_LONG / 8))) pci_edu_dma_op {
@@ -79,8 +81,7 @@ static ssize_t pci_edu_read(struct file *file, char __user *udata, size_t size,
   dma->cmd = PCI_EDU_REG_DMA_CMD_START | PCI_EDU_REG_DMA_CMD_FROM_EDU_TO_RAM |
              PCI_EDU_REG_DMA_CMD_INT_ENABLE;
 
-  while (dma->cmd & PCI_EDU_REG_DMA_CMD_START)
-    ;
+  wait_event_interruptible(data->wq, !(dma->cmd & PCI_EDU_REG_DMA_CMD_START));
 
   size = dma->size;
   rv = copy_to_user(udata, buf, size);
@@ -167,7 +168,11 @@ static int pci_edu_open(struct inode *inode, struct file *file) {
   struct pci_dev *pdev = data->pdev;
   struct device *dev = &pdev->dev;
 
+  if (data->owner)
+    return -EBUSY;
+
   dev_info(dev, "opened %s\n", misc->nodename);
+  data->owner = file;
 
   return 0;
 }
@@ -189,6 +194,7 @@ static int pci_edu_release(struct inode *inode, struct file *file) {
   struct pci_dev *pdev = data->pdev;
   struct device *dev = &pdev->dev;
 
+  data->owner = NULL;
   dev_info(dev, "closed %s\n", misc->nodename);
 
   return 0;
@@ -240,6 +246,8 @@ static irqreturn_t pci_edu_handler(int irq, void *irqdata) {
   } while (true);
   // spin_unlock(&cp->lock);
 
+  wake_up(&data->wq);
+
   return IRQ_RETVAL(handled);
 }
 
@@ -259,6 +267,7 @@ static void *pci_edu_data_new(struct pci_dev *pdev) {
   snprintf(data->nodename, sizeof(data->nodename), "%s%u", PCI_EDU_DRV_NAME,
            pci_edu_counter++);
   data->misc.nodename = data->nodename;
+  init_waitqueue_head(&data->wq);
 
   return data;
 }

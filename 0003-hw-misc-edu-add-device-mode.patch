@@ -1,0 +1,290 @@
+From 4f7e80d36a1fc077edf14d9a29109a668ebc5449 Mon Sep 17 00:00:00 2001
+From: Christopher Friedt <chrisfriedt@gmail.com>
+Date: Sat, 19 Feb 2022 08:18:01 -0500
+Subject: [PATCH] hw: misc: edu: add device mode
+
+This change does little more than manage the socket role of
+the edu instance. If edu is in 'device' mode (i.e. it is a
+PCIe EPC, edu.device=on), then it opens a server socket and
+accepts connections.
+
+Otherwise, with edu.device=off (default), it opens a socket
+and attempts to connect to the 'server'.
+
+Signed-off-by: Christopher Friedt <chrisfriedt@gmail.com>
+---
+ hw/misc/edu.c | 214 ++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 200 insertions(+), 14 deletions(-)
+
+diff --git a/hw/misc/edu.c b/hw/misc/edu.c
+index 6cc14c89c2..0c02e5cf4e 100644
+--- a/hw/misc/edu.c
++++ b/hw/misc/edu.c
+@@ -22,6 +22,8 @@
+  * DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include <poll.h>
++
+ #include "qemu/osdep.h"
+ #include "qemu/units.h"
+ #include "hw/pci/pci.h"
+@@ -77,6 +79,10 @@ struct EduState {
+     uint64_t dma_mask;
+ 
+     int remote_fd;
++    int server_fd;
++    int cancel_fd[2];
++    QemuThread epc_thread;
++    bool device;
+ };
+ 
+ static bool edu_msi_enabled(EduState *edu)
+@@ -339,6 +345,147 @@ static const MemoryRegionOps edu_mmio_ops = {
+ 
+ };
+ 
++static void *edu_epc_thread(void *opaque)
++{
++    EduState *edu = opaque;
++
++    if (socketpair(AF_UNIX, SOCK_STREAM, 0, edu->cancel_fd) == -1)
++    {
++        perror("socketpair");
++        return NULL;
++    }
++
++    edu->server_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (edu->server_fd == -1)
++    {
++        perror("socket");
++        goto close_socketpair;
++    }
++
++    if (setsockopt(edu->server_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) == -1)
++    {
++        perror("setsockopt");
++        goto close_server;
++    }
++
++    // TODO: get these parameters via command line
++    const char *server_addr = "127.0.0.1";
++    int16_t server_port = 4242;
++
++    struct sockaddr_storage _sa = {0};
++    struct sockaddr_in *sai = (struct sockaddr_in *)&_sa;
++    socklen_t len = sizeof(*sai);
++    sai->sin_family = AF_INET;
++    inet_pton(AF_INET, server_addr, &sai->sin_addr.s_addr);
++    sai->sin_port = htons(server_port);
++
++    if (bind(edu->server_fd, (struct sockaddr *)sai, len) == -1)
++    {
++        perror("bind");
++        goto close_server;
++    }
++
++    if (server_port == 0)
++    {
++        len = sizeof(_sa);
++        if (getsockname(edu->server_fd, (struct sockaddr *)&_sa, &len) == -1)
++        {
++            perror("getsockname");
++            goto close_server;
++        }
++
++        server_port = ntohs(sai->sin_port);
++    }
++
++    printf("server socket bound to %s:%d\n", server_addr, server_port);
++
++    if (listen(edu->server_fd, 0) == -1)
++    {
++        perror("listen");
++        goto close_server;
++    }
++
++    while (1)
++    {
++        struct pollfd pollfds[] = {
++            {
++                .fd = edu->server_fd,
++                .events = POLLIN,
++            },
++            {
++                .fd = edu->cancel_fd[0],
++                .events = POLLIN,
++            },
++        };
++
++        if (poll(pollfds, ARRAY_SIZE(pollfds), -1) == -1)
++        {
++            perror("poll");
++            goto close_server;
++        }
++
++        if ((pollfds[1].revents & (POLLIN | POLL_ERR)) != 0)
++        {
++            printf("terminating thread\n");
++            goto close_server;
++        }
++
++        printf("accepting client connection..\n");
++        len = sizeof(_sa);
++        edu->remote_fd = accept(edu->server_fd, (struct sockaddr *)sai, &len);
++        if (edu->remote_fd == -1)
++        {
++            perror("accept");
++            goto close_server;
++        }
++
++        // TODO: print address / port of client socket
++
++        while (1)
++        {
++            pollfds[0] = (struct pollfd){
++                .fd = edu->remote_fd,
++                .events = POLLIN,
++            };
++            pollfds[1] = (struct pollfd){
++                .fd = edu->cancel_fd[0],
++                .events = POLLIN,
++            };
++
++            if (poll(pollfds, ARRAY_SIZE(pollfds), -1) == -1)
++            {
++                perror("poll");
++                goto close_client;
++            }
++
++            if ((pollfds[1].revents & (POLLIN | POLL_ERR)) != 0 || (pollfds[0].revents & POLL_ERR) != 0)
++            {
++                printf("terminating thread\n");
++                goto close_client;
++            }
++
++            edu_raise_irq(edu, DMA_IRQ);
++            usleep(100000);
++        }
++    }
++
++close_client:
++    shutdown(edu->remote_fd, SHUT_RDWR);
++    edu->remote_fd = -1;
++
++close_server:
++    shutdown(edu->server_fd, SHUT_RDWR);
++    edu->server_fd = -1;
++
++close_socketpair:
++    close(edu->cancel_fd[0]);
++    edu->cancel_fd[0] = -1;
++    close(edu->cancel_fd[1]);
++    edu->cancel_fd[1] = -1;
++
++    return NULL;
++}
++
+ /*
+  * We purposely use a thread, so that users are forced to wait for the status
+  * register.
+@@ -416,29 +563,47 @@ static void pci_edu_realize(PCIDevice *pdev, Error **errp)
+         return;
+     }
+ 
+-    // TODO: get these parameters via command line
+-    const char *remote_addr = "127.0.0.1";
+-    const int16_t remote_port = 4242;
+-
+-    struct sockaddr_in sai = {0};
+-    sai.sin_family = AF_INET;
+-    inet_pton(AF_INET, remote_addr, &sai.sin_addr.s_addr);
+-    sai.sin_port = htons(remote_port);
+-
+-    if (connect(edu->remote_fd, &sai, sizeof(sai)) == -1) {
+-        perror("connect");
+-        close(edu->remote_fd);
+-        edu->remote_fd = -1;
++    if (!edu->device)
++    {
++        // TODO: get these parameters via command line
++        const char *remote_addr = "127.0.0.1";
++        const int16_t remote_port = 4242;
++
++        struct sockaddr_in sai = {0};
++        sai.sin_family = AF_INET;
++        inet_pton(AF_INET, remote_addr, &sai.sin_addr.s_addr);
++        sai.sin_port = htons(remote_port);
++
++        if (connect(edu->remote_fd, (struct sockaddr *)&sai, sizeof(sai)) == -1)
++        {
++            perror("connect");
++            close(edu->remote_fd);
++            edu->remote_fd = -1;
++            return;
++        }
++
++        printf("connected to %s:%d\n", remote_addr, remote_port);
+         return;
+     }
+ 
+-    printf("connected to %s:%d\n", remote_addr, remote_port);
++    // in device mode, spin up a server thread
++    qemu_thread_create(&edu->epc_thread, "edu_epc", edu_epc_thread,
++                       edu, QEMU_THREAD_JOINABLE);
+ }
+ 
+ static void pci_edu_uninit(PCIDevice *pdev)
+ {
+     EduState *edu = EDU(pdev);
+ 
++    if (edu->device)
++    {
++        printf("cancelling EPC thread\n");
++        write(edu->cancel_fd[1], "bye", 3);
++        printf("joining EPC thread..\n");
++        qemu_thread_join(&edu->epc_thread);
++        printf("joined EPC thread\n");
++    }
++
+     qemu_mutex_lock(&edu->thr_mutex);
+     edu->stopping = true;
+     qemu_mutex_unlock(&edu->thr_mutex);
+@@ -452,6 +617,20 @@ static void pci_edu_uninit(PCIDevice *pdev)
+     msi_uninit(pdev);
+ }
+ 
++static bool edu_get_device_param(Object *obj, Error **e)
++{
++    EduState *edu = EDU(obj);
++
++    return edu->device;
++}
++
++static void edu_set_device_param(Object *obj, bool device, Error **e)
++{
++    EduState *edu = EDU(obj);
++
++    edu->device = device;
++}
++
+ static void edu_instance_init(Object *obj)
+ {
+     EduState *edu = EDU(obj);
+@@ -459,6 +638,13 @@ static void edu_instance_init(Object *obj)
+     edu->dma_mask = (1UL << 28) - 1;
+     object_property_add_uint64_ptr(obj, "dma_mask",
+                                    &edu->dma_mask, OBJ_PROP_FLAG_READWRITE);
++    object_property_add_bool(obj, "device", edu_get_device_param, edu_set_device_param);
++
++    edu->device = false;
++    edu->remote_fd = -1;
++    edu->server_fd = -1;
++    edu->cancel_fd[0] = -1;
++    edu->cancel_fd[1] = -1;
+ }
+ 
+ static void edu_class_init(ObjectClass *class, void *data)
+-- 
+2.30.2
+
