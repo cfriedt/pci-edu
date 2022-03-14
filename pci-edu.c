@@ -81,20 +81,29 @@ static ssize_t pci_edu_read(struct file *file, char __user *udata, size_t size,
   dma->cmd = PCI_EDU_REG_DMA_CMD_START | PCI_EDU_REG_DMA_CMD_FROM_EDU_TO_RAM |
              PCI_EDU_REG_DMA_CMD_INT_ENABLE;
 
+  dev_info(dev, "calling wait_event_interruptible()\n");
   wait_event_interruptible(data->wq, !(dma->cmd & PCI_EDU_REG_DMA_CMD_START));
+
+  if (dma->size == 0)
+  {
+    dev_info(dev, "read %zu bytes from %s\n", size, misc->nodename);
+    rv = -EAGAIN;
+    goto free_dma;
+  }
 
   size = dma->size;
   rv = copy_to_user(udata, buf, size);
   if (rv != 0) {
     dev_err(dev, "only copied %zu/%zu bytes\n", size - rv, size);
-    size -= rv;
+    rv = size - rv;
   }
 
-  dev_info(dev, "read %zu bytes from %s\n", size, misc->nodename);
+  dev_info(dev, "read %d bytes from %s\n", rv, misc->nodename);
 
+free_dma:
   dma_free_coherent(dev, size, buf, dma_handle);
 
-  return size;
+  return rv;
 }
 
 static ssize_t pci_edu_write(struct file *file, const char __user *udata,
